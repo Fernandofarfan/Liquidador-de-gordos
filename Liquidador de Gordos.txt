@@ -1,0 +1,224 @@
+/@version=5
+indicator("FVG Order Blocks [Precision + EMAs]", overlay=true, max_boxes_count=500, max_lines_count=500, max_bars_back=2000)
+
+// ＩＮＰＵＴＳ ========================================================================================================{
+
+int lookback       = 2000
+bool auto_filter   = input.bool(true, "Filtro Automático por Temporalidad (1H-1D)", group="Precisión & Filtros")
+float manual_filt  = input.float(0.5, "Filtro Manual % (si Auto está apagado)", minval=0, maxval=100, step=0.1, group="Precisión & Filtros")
+bool use_vol       = input.bool(true, "Exigir Volumen Institucional en Impulso", group="Precisión & Filtros")
+float vol_mult     = input.float(1.1, "Multiplicador de Volumen (vs Media 20)", minval=0.5, step=0.1, group="Precisión & Filtros")
+string zone_mode   = input.string("Vela Origen (Mecha Real)", "Grosor de la Zona", options=["Vela Origen (Mecha Real)", "ATR Acotado (0.5x)"], group="Precisión & Filtros")
+bool use_mitig     = input.bool(true, "Mitigación Dinámica (Achicar al consumir liquidez)", group="Comportamiento de Liquidez")
+
+bool show_imb      = input.bool(true, "Fair Value Gaps", inline="1", group="Visualización FVG")
+int box_amount     = input.int(6, "Cantidad de Bloques", minval=1, maxval=50, group="Visualización FVG")
+bool show_broken   = input.bool(false, "Mostrar Bloques Rotos", group="Visualización FVG")
+bool show_signal   = input.bool(false, "Señales de Rechazo", group="Visualización FVG")
+
+color col_bull     = input.color(#14be94, "Color +/-", inline="2", group="Visualización FVG")
+color col_bear     = input.color(color.rgb(194, 25, 25), "", inline="2", group="Visualización FVG")
+
+// Inputs de EMAs
+bool show_ema7     = input.bool(true, "Mostrar EMA 7", group="Medias Móviles (EMAs)")
+color col_ema7     = input.color(color.yellow, "Color EMA 7", group="Medias Móviles (EMAs)")
+bool show_ema25    = input.bool(true, "Mostrar EMA 25", group="Medias Móviles (EMAs)")
+color col_ema25    = input.color(color.blue, "Color EMA 25", group="Medias Móviles (EMAs)")
+bool show_ema200   = input.bool(true, "Mostrar EMA 200", group="Medias Móviles (EMAs)")
+color col_ema200   = input.color(color.orange, "Color EMA 200", group="Medias Móviles (EMAs)")
+
+// Arrays para guardar cajas y su fuerza de desbalance
+var boxes1 = array.new<box>()
+var strength1 = array.new<float>()
+
+var boxes2 = array.new<box>()
+var strength2 = array.new<float>()
+
+var bool isBull_gap = false  
+var bool isBear_gap = false  
+// }
+
+
+// ＣＡＬＣＵＬＡＴＩＯＮＳ ============================================================================================={
+
+// 1. Cálculo de EMAs
+float ema7  = ta.ema(close, 7)
+float ema25 = ta.ema(close, 25)
+float ema200 = ta.ema(close, 200)
+
+// Plot de EMAs en el gráfico
+plot(show_ema7 ? ema7 : na, "EMA 7", color=col_ema7, linewidth=1)
+plot(show_ema25 ? ema25 : na, "EMA 25", color=col_ema25, linewidth=2)
+plot(show_ema200 ? ema200 : na, "EMA 200", color=col_ema200, linewidth=2)
+
+// 2. Filtro Dinámico adaptado a 1H, 2H, 3H, 4H y 1D
+float tf_min = timeframe.in_seconds(timeframe.period) / 60.0
+float dynamic_filter = switch
+    tf_min <= 60  => 0.35 // 1H o menor
+    tf_min <= 120 => 0.50 // 2H
+    tf_min <= 180 => 0.65 // 3H
+    tf_min <= 240 => 0.80 // 4H
+    => 1.50               // Diario (1D) o superior
+
+float active_filter = auto_filter ? dynamic_filter : manual_filt
+
+// 3. ATR más reactivo (50 en vez de 200) y Filtro de Volumen en la vela de desplazamiento (bar_index - 1)
+float atr = ta.atr(50)
+float vol_ma = ta.sma(volume, 20)
+bool vol_ok = not use_vol or (volume[1] > vol_ma[1] * vol_mult)
+
+// Porcentajes de Desbalance (FVG)
+float filt_up = (low - high[2]) / low * 100
+float filt_dn = (low[2] - high) / low[2] * 100
+
+float max_up = math.max(ta.highest(filt_up, 200), 0.001)
+float max_dn = math.max(ta.highest(filt_dn, 200), 0.001)
+
+// Detección de Gaps confirmados
+if barstate.isconfirmed and (last_bar_index - bar_index < lookback)
+    isBull_gap := high[2] < low and high[2] < high[1] and low[2] < low and filt_up > active_filter and vol_ok
+    isBear_gap := low[2] > high and low[2] > low[1] and high[2] > high and filt_dn > active_filter and vol_ok
+else
+    isBull_gap := false
+    isBear_gap := false
+
+// 4. Creación de Bloques Quirúrgicos (Anclados a la estructura real de la vela origen)
+if isBull_gap
+    if show_imb
+        box.new(bar_index-1, low, bar_index + 5, high[2], na, 0, 
+             bgcolor    = color.from_gradient(filt_up, 0, max_up, color.new(chart.fg_color, 90), color.new(chart.fg_color, 70)),
+             text       = str.tostring(filt_up, format.percent),
+             text_color = chart.fg_color)
+
+    float bull_top = high[2]
+    float raw_bottom = math.min(low[2], low[1])
+    float bull_bottom = zone_mode == "Vela Origen (Mecha Real)" ? math.max(raw_bottom, bull_top - atr * 1.2) : (bull_top - atr * 0.5)
+    
+    if bull_top - bull_bottom < atr * 0.15
+        bull_bottom := bull_top - atr * 0.25
+
+    box b1 = box.new(bar_index-2, bull_top, last_bar_index, bull_bottom, col_bull, 1, 
+                 bgcolor     = color.from_gradient(filt_up, 0, max_up, color.new(col_bull, 85), color.new(col_bull, 65)), 
+                 text        = str.tostring(filt_up, format.percent), 
+                 text_size   = size.small,
+                 text_color  = chart.fg_color, 
+                 text_halign = text.align_right)
+    boxes1.push(b1)
+    strength1.push(filt_up)
+
+if isBear_gap
+    if show_imb
+        box.new(bar_index-1, low[2], bar_index + 5, high, na, 0,
+             bgcolor    = color.from_gradient(filt_dn, 0, max_dn, color.new(chart.fg_color, 90), color.new(chart.fg_color, 70)),
+             text       = "-" + str.tostring(filt_dn, format.percent),
+             text_color = chart.fg_color)
+
+    float bear_bottom = low[2]
+    float raw_top = math.max(high[2], high[1])
+    float bear_top = zone_mode == "Vela Origen (Mecha Real)" ? math.min(raw_top, bear_bottom + atr * 1.2) : (bear_bottom + atr * 0.5)
+    
+    if bear_top - bear_bottom < atr * 0.15
+        bear_top := bear_bottom + atr * 0.25
+
+    box b2 = box.new(bar_index-2, bear_top, last_bar_index, bear_bottom, col_bear, 1,
+                 bgcolor     = color.from_gradient(filt_dn, 0, max_dn, color.new(col_bear, 85), color.new(col_bear, 65)),
+                 text        = "-" + str.tostring(filt_dn, format.percent),
+                 text_size   = size.small,
+                 text_color  = chart.fg_color, 
+                 text_halign = text.align_right)
+    boxes2.push(b2)
+    strength2.push(filt_dn)
+
+
+// 5. Gestión de Bloques Alcistas (Mitigación Parcial, Invalidación por Cierre y Limpieza Segura)
+if boxes1.size() > 0
+    for i = boxes1.size() - 1 to 0
+        box b_id = boxes1.get(i)
+        float b_top = box.get_top(b_id)
+        float b_bot = box.get_bottom(b_id)
+        
+        if low <= b_top and close > b_top and not isBull_gap and show_signal
+            label.new(bar_index, low, "︽", color = color(na), textcolor = col_bull, style = label.style_label_up)
+
+        if close < b_bot
+            if show_broken
+                box.set_border_width(b_id, 0)
+                box.set_bgcolor(b_id, color.new(chart.fg_color, 88))
+                box.set_right(b_id, bar_index)
+            else
+                box.delete(b_id)
+            boxes1.remove(i)
+            strength1.remove(i)
+            continue
+
+        if use_mitig and low < b_top and low > b_bot and bar_index > box.get_left(b_id) + 2
+            box.set_top(b_id, low)
+            b_top := low
+
+        for j = boxes1.size() - 1 to 0
+            if i != j and i < boxes1.size() and j < boxes1.size()
+                box other_b = boxes1.get(j)
+                float o_top = box.get_top(other_b)
+                float o_bot = box.get_bottom(other_b)
+                if math.max(b_bot, o_bot) < math.min(b_top, o_top)
+                    if strength1.get(i) < strength1.get(j)
+                        box.delete(b_id)
+                        boxes1.remove(i)
+                        strength1.remove(i)
+                        break
+
+
+// 6. Gestión de Bloques Bajistas (Mitigación Parcial, Invalidación por Cierre y Limpieza Segura)
+if boxes2.size() > 0
+    for i = boxes2.size() - 1 to 0
+        box b_id = boxes2.get(i)
+        float b_top = box.get_top(b_id)
+        float b_bot = box.get_bottom(b_id)
+        
+        if high >= b_bot and close < b_bot and not isBear_gap and show_signal
+            label.new(bar_index, high, "﹀", color = color(na), textcolor = col_bear, style = label.style_label_down)
+
+        if close > b_top
+            if show_broken
+                box.set_border_width(b_id, 0)
+                box.set_bgcolor(b_id, color.new(chart.fg_color, 88))
+                box.set_right(b_id, bar_index)
+            else
+                box.delete(b_id)
+            boxes2.remove(i)
+            strength2.remove(i)
+            continue
+
+        if use_mitig and high > b_bot and high < b_top and bar_index > box.get_left(b_id) + 2
+            box.set_bottom(b_id, high)
+            b_bot := high
+
+        for j = boxes2.size() - 1 to 0
+            if i != j and i < boxes2.size() and j < boxes2.size()
+                box other_b = boxes2.get(j)
+                float o_top = box.get_top(other_b)
+                float o_bot = box.get_bottom(other_b)
+                if math.max(b_bot, o_bot) < math.min(b_top, o_top)
+                    if strength2.get(i) < strength2.get(j)
+                        box.delete(b_id)
+                        boxes2.remove(i)
+                        strength2.remove(i)
+                        break
+
+
+// Extender bloques activos hacia la derecha en la barra actual
+if barstate.islast
+    for b_id in boxes1
+        box.set_right(b_id, bar_index + 15)
+    for b_id in boxes2
+        box.set_right(b_id, bar_index + 15)
+
+// Limitar la cantidad máxima de bloques en pantalla
+while boxes1.size() > box_amount
+    box.delete(boxes1.shift())
+    strength1.shift()
+
+while boxes2.size() > box_amount
+    box.delete(boxes2.shift())
+    strength2.shift()
+// }
